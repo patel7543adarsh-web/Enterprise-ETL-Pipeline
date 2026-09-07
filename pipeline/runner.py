@@ -1,6 +1,10 @@
 """
 Enterprise ETL Pipeline Orchestrator & CLI Runner.
-Executes Week 1 API Extraction & S3 Staging, and Week 2 Data Cleaning & Transformation.
+Executes:
+- Week 1: API Extraction & S3 Staging
+- Week 2: Polars Data Cleaning, Schema Mapping & Quality Validation
+- Week 3: Target Data Warehouse Batch Upsert & Audit Logging
+- Week 4: Multi-Channel Alerting & Failure Notifications
 """
 
 import argparse
@@ -27,11 +31,14 @@ from models.unified.canonical_models import (
     UnifiedSubscription,
     UnifiedTransaction,
 )
+from notifications.manager import AlertManager, get_alert_manager
 from storage.s3_client import S3DataLakeWriter, get_storage_writer
 from storage.state_store import IncrementalStateStore
 from transformers.salesforce_transformer import SalesforceDataTransformer
 from transformers.stripe_transformer import StripeDataTransformer
 from transformers.unified_mapper import UnifiedSchemaMapper
+from warehouse.connection import WarehouseConnectionManager
+from warehouse.loader import WarehouseUpsertLoader
 
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -45,6 +52,7 @@ class ETLPipelineRunner:
         self,
         settings: Optional[AppSettings] = None,
         use_mock: bool = False,
+        custom_db_url: Optional[str] = None,
     ):
         self.settings = settings or get_settings()
         self.use_mock = use_mock
@@ -62,6 +70,15 @@ class ETLPipelineRunner:
             storage_writer=self.storage_writer,
             state_store=self.state_store,
         )
+
+        self.warehouse_conn_mgr = WarehouseConnectionManager(
+            settings=self.settings.warehouse,
+            custom_url=custom_db_url,
+        )
+        self.warehouse_loader = WarehouseUpsertLoader(
+            connection_manager=self.warehouse_conn_mgr
+        )
+        self.alert_manager = get_alert_manager(settings=self.settings.notification)
 
         if self.use_mock:
             self._setup_mocks()
@@ -189,6 +206,10 @@ class ETLPipelineRunner:
             unified_companies_df.write_json(curated_dir / "dim_companies.json")
 
         return {
+            "customers_df": unified_customers_df,
+            "transactions_df": unified_transactions_df,
+            "subscriptions_df": unified_subscriptions_df,
+            "companies_df": unified_companies_df,
             "customers_count": len(unified_customers_df),
             "transactions_count": len(unified_transactions_df),
             "subscriptions_count": len(unified_subscriptions_df),
@@ -197,10 +218,37 @@ class ETLPipelineRunner:
             "curated_path": str(curated_dir.resolve()),
         }
 
+    def run_week3_loading(
+        self,
+        transformation_results: Dict[str, Any],
+        batch_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executes Week 3: Upsert curated canonical datasets into target Data Warehouse tables.
+        """
+        console.rule("[bold magenta]Week 3: Data Warehouse Batch Upsert & Sync[/bold magenta]")
+        console.print(f"[cyan]Target Warehouse Dialect:[/cyan] [bold]{self.warehouse_conn_mgr.get_dialect_name().upper()}[/bold]")
+
+        customers_df = transformation_results.get("customers_df")
+        transactions_df = transformation_results.get("transactions_df")
+        subscriptions_df = transformation_results.get("subscriptions_df")
+        companies_df = transformation_results.get("companies_df")
+
+        load_results = self.warehouse_loader.load_all_canonical_datasets(
+            customers_data=customers_df,
+            transactions_data=transactions_df,
+            subscriptions_data=subscriptions_df,
+            companies_data=companies_df,
+            batch_id=batch_id,
+        )
+
+        return load_results
+
     def print_summary(
         self,
         extraction_results: Dict[str, Any],
         transformation_results: Dict[str, Any],
+        loading_results: Optional[Dict[str, Any]],
         duration: float,
     ) -> None:
         """Renders rich summary tables to the terminal."""
@@ -241,11 +289,39 @@ class ETLPipelineRunner:
 
         console.print(trans_table)
 
+        # 3. Warehouse Loading Table (Week 3)
+        total_inserted = 0
+        total_updated = 0
+        if loading_results:
+            load_table = Table(title="[bold magenta]Week 3 Data Warehouse Upsert Summary[/bold magenta]", show_header=True)
+            load_table.add_column("Target Table", style="bold magenta")
+            load_table.add_column("Processed", justify="right")
+            load_table.add_column("Inserted", justify="right", style="green")
+            load_table.add_column("Updated", justify="right", style="yellow")
+            load_table.add_column("Duration (s)", justify="right", style="cyan")
+            load_table.add_column("Status", justify="center")
+
+            for tbl, res in loading_results.items():
+                ins = res.get("rows_inserted", 0)
+                upd = res.get("rows_updated", 0)
+                total_inserted += ins
+                total_updated += upd
+                load_table.add_row(
+                    tbl,
+                    str(res.get("rows_processed", 0)),
+                    str(ins),
+                    str(upd),
+                    f"{res.get('duration_seconds', 0.0):.2f}",
+                    "[green]SUCCESS[/green]" if res.get("status") == "SUCCESS" else "[red]FAILED[/red]",
+                )
+            console.print(load_table)
+
         panel_content = (
             f"[bold]Total Extracted:[/bold] {total_extracted} records\n"
             f"[bold]Curated Staging:[/bold] {transformation_results.get('curated_path')}\n"
+            f"[bold]Warehouse Upsert:[/bold] {total_inserted} inserted, {total_updated} updated\n"
             f"[bold]Pipeline Duration:[/bold] {duration:.2f}s\n"
-            f"[bold]Status:[/bold] [green]ALL ETL STAGES COMPLETED SUCCESSFULLY[/green]"
+            f"[bold]Status:[/bold] [green]ALL 4 WEEKS ETL STAGES COMPLETED SUCCESSFULLY[/green]"
         )
         console.print(Panel(panel_content, title="[bold white on blue] ETL Pipeline Run Completed [/bold white on blue]"))
 
@@ -270,24 +346,71 @@ def main() -> None:
         action="store_true",
         help="Reset watermark state store before running",
     )
+    parser.add_argument(
+        "--no-sync-db",
+        action="store_true",
+        help="Skip Week 3 Data Warehouse loading phase",
+    )
+    parser.add_argument(
+        "--db-url",
+        type=str,
+        default=None,
+        help="Custom database connection URL (e.g. postgresql://... or sqlite://...)",
+    )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Force send Slack and Email notifications upon completion",
+    )
 
     args = parser.parse_args()
 
     start_time = time.time()
-    runner = ETLPipelineRunner(use_mock=(args.mode == "mock"))
+    runner = ETLPipelineRunner(
+        use_mock=(args.mode == "mock"),
+        custom_db_url=args.db_url,
+    )
 
     if args.clean_state:
         logger.info("Clearing incremental state store.")
         runner.state_store.reset_state()
 
-    # Step 1: Week 1 Extraction
-    extraction_results = runner.run_week1_extraction(sources=[args.source])
+    try:
+        # Step 1: Week 1 Extraction
+        extraction_results = runner.run_week1_extraction(sources=[args.source])
 
-    # Step 2: Week 2 Transformation
-    transformation_results = runner.run_week2_transformation()
+        # Step 2: Week 2 Transformation
+        transformation_results = runner.run_week2_transformation()
 
-    total_duration = time.time() - start_time
-    runner.print_summary(extraction_results, transformation_results, total_duration)
+        # Step 3: Week 3 Data Warehouse Loading (Unless skipped)
+        loading_results = None
+        if not args.no_sync_db:
+            loading_results = runner.run_week3_loading(transformation_results)
+
+        total_duration = time.time() - start_time
+        runner.print_summary(extraction_results, transformation_results, loading_results, total_duration)
+
+        if args.notify or runner.settings.notification.alert_on_success:
+            runner.alert_manager.notify_pipeline_success(
+                pipeline_name="Enterprise ETL Pipeline",
+                metrics={
+                    "sources": args.source,
+                    "mode": args.mode,
+                    "total_extracted": sum(r.get("total_records", 0) for r in extraction_results.values()),
+                    "warehouse_synced": "True" if loading_results else "False",
+                },
+                duration_seconds=total_duration,
+            )
+
+    except Exception as exc:
+        logger.exception("Pipeline execution encountered a fatal error.")
+        runner.alert_manager.notify_pipeline_failure(
+            pipeline_name="Enterprise ETL Pipeline",
+            error_message=str(exc),
+            stage="runner.main",
+            exception=exc,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
