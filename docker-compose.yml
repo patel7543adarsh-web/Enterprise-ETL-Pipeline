@@ -1,0 +1,149 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------------------------------
+  # Target PostgreSQL Data Warehouse
+  # ----------------------------------------------------------------------------
+  postgres_warehouse:
+    image: postgres:16-alpine
+    container_name: etl_postgres_warehouse
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: enterprise_dw
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dw_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d enterprise_dw"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # Airflow Metadata Database
+  # ----------------------------------------------------------------------------
+  airflow_postgres:
+    image: postgres:16-alpine
+    container_name: airflow_postgres_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflowpassword
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # Airflow Webserver UI
+  # ----------------------------------------------------------------------------
+  airflow_webserver:
+    image: apache/airflow:2.9.2-python3.11
+    container_name: airflow_webserver
+    restart: unless-stopped
+    depends_on:
+      airflow_postgres:
+        condition: service_healthy
+      postgres_warehouse:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflowpassword@airflow_postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: enterprise_secret_key_12345
+      DB_TYPE: postgres
+      DB_HOST: postgres_warehouse
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgrespassword
+      DB_DATABASE: enterprise_dw
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./config:/opt/airflow/config
+      - ./models:/opt/airflow/models
+      - ./extractors:/opt/airflow/extractors
+      - ./storage:/opt/airflow/storage
+      - ./mock_api:/opt/airflow/mock_api
+      - ./transformers:/opt/airflow/transformers
+      - ./warehouse:/opt/airflow/warehouse
+      - ./notifications:/opt/airflow/notifications
+      - ./pipeline:/opt/airflow/pipeline
+      - ./data_lake_staging:/opt/airflow/data_lake_staging
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --firstname Enterprise --lastname Admin --role Admin --email admin@example.com --password admin || true &&
+               airflow webserver"
+
+  # ----------------------------------------------------------------------------
+  # Airflow Scheduler
+  # ----------------------------------------------------------------------------
+  airflow_scheduler:
+    image: apache/airflow:2.9.2-python3.11
+    container_name: airflow_scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow_webserver:
+        condition: service_started
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflowpassword@airflow_postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      DB_TYPE: postgres
+      DB_HOST: postgres_warehouse
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgrespassword
+      DB_DATABASE: enterprise_dw
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./config:/opt/airflow/config
+      - ./models:/opt/airflow/models
+      - ./extractors:/opt/airflow/extractors
+      - ./storage:/opt/airflow/storage
+      - ./mock_api:/opt/airflow/mock_api
+      - ./transformers:/opt/airflow/transformers
+      - ./warehouse:/opt/airflow/warehouse
+      - ./notifications:/opt/airflow/notifications
+      - ./pipeline:/opt/airflow/pipeline
+      - ./data_lake_staging:/opt/airflow/data_lake_staging
+    command: airflow scheduler
+
+  # ----------------------------------------------------------------------------
+  # Standalone ETL Pipeline Runner Container
+  # ----------------------------------------------------------------------------
+  etl_pipeline_runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: etl_pipeline_runner
+    depends_on:
+      postgres_warehouse:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: development
+      DB_TYPE: postgres
+      DB_HOST: postgres_warehouse
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgrespassword
+      DB_DATABASE: enterprise_dw
+      STORAGE_MODE: local
+      LOCAL_STORAGE_PATH: ./data_lake_staging
+    volumes:
+      - ./data_lake_staging:/app/data_lake_staging
+    command: ["--source", "all", "--mode", "mock"]
+
+volumes:
+  postgres_dw_data:
+    driver: local
+  airflow_db_data:
+    driver: local

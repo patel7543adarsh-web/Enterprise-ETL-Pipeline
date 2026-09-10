@@ -1,0 +1,17 @@
+.git
+.gitignore
+.venv
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+.DS_Store
+*.tmp
+data_lake_staging/*
+!data_lake_staging/.gitkeep
